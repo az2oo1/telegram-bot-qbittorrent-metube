@@ -40,8 +40,8 @@ The bot depends **only on the Docker image and your `.env` file**.
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/dominatos/qbittorrent-telegram-bot.git
-   cd qbittorrent-telegram-bot
+   git clone https://github.com/az2oo1/telegram-bot-qbittorrent-metube.git
+   cd telegram-bot-qbittorrent-metube
    ```
 
 2. **Create your `.env` file**:

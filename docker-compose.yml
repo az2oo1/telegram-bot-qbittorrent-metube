@@ -1,6 +1,6 @@
 services:
   qbot:
-    build: .
+    image: ghcr.io/az2oo1/telegram-bot-qbittorrent-metube:latest
     container_name: qbot
     restart: unless-stopped
     env_file:
