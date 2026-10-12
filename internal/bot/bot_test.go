@@ -78,3 +78,43 @@ func TestDownloadTorrentBytes(t *testing.T) {
 		t.Errorf("unexpected filename: %s, expected ubuntu.torrent", fileName)
 	}
 }
+
+func TestRenderProgressBar(t *testing.T) {
+	if bar := renderProgressBar(0, 10); bar != "░░░░░░░░░░" {
+		t.Errorf("expected 0%% bar to be all empty, got %s", bar)
+	}
+	if bar := renderProgressBar(0.5, 10); bar != "█████░░░░░" {
+		t.Errorf("expected 50%% bar to be half filled, got %s", bar)
+	}
+	if bar := renderProgressBar(1.0, 10); bar != "██████████" {
+		t.Errorf("expected 100%% bar to be completely filled, got %s", bar)
+	}
+	if bar := renderProgressBar(-0.2, 10); bar != "░░░░░░░░░░" {
+		t.Errorf("expected negative to clamp to 0, got %s", bar)
+	}
+	if bar := renderProgressBar(1.5, 10); bar != "██████████" {
+		t.Errorf("expected >1 to clamp to 10, got %s", bar)
+	}
+}
+
+func TestMeTubeKeyboards(t *testing.T) {
+	b := &Bot{}
+	cancelKb := b.meTubeCancelKeyboard("tok123")
+	if len(cancelKb.InlineKeyboard) != 1 || len(cancelKb.InlineKeyboard[0]) != 1 {
+		t.Fatalf("unexpected cancel keyboard structure")
+	}
+	if cancelKb.InlineKeyboard[0][0].CallbackData != "mt_cancel_active:tok123" {
+		t.Errorf("unexpected cancel callback data: %s", cancelKb.InlineKeyboard[0][0].CallbackData)
+	}
+
+	videoKb := b.meTubeVideoKeyboard("tok456")
+	if len(videoKb.InlineKeyboard) != 1 || len(videoKb.InlineKeyboard[0]) != 2 {
+		t.Fatalf("unexpected video keyboard structure")
+	}
+	if videoKb.InlineKeyboard[0][0].CallbackData != "mt_del_file:tok456" {
+		t.Errorf("unexpected delete callback data: %s", videoKb.InlineKeyboard[0][0].CallbackData)
+	}
+	if videoKb.InlineKeyboard[0][1].CallbackData != "mt_keep_file:tok456" {
+		t.Errorf("unexpected keep callback data: %s", videoKb.InlineKeyboard[0][1].CallbackData)
+	}
+}

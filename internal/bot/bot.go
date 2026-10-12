@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -36,11 +37,12 @@ const (
 
 // PendingDownload holds state for an interactive download selection session.
 type PendingDownload struct {
-	Type          string // "magnet", "metube", "file", "video", "photo"
+	Type          string // "magnet", "metube", "file", "video", "photo", "torrent_url"
 	Magnet        string
 	URL           string
 	FileID        string
 	FileName      string
+	FileData      []byte
 	DiskIdx       int
 	MeTubeFormat  string // "video" or "audio"
 	MeTubeQuality string // "best", "1080p", "720p", "480p"
@@ -51,14 +53,30 @@ type PendingDownload struct {
 
 // ActiveMeTubeJob tracks an in-flight MeTube download job.
 type ActiveMeTubeJob struct {
-	URL         string
-	ChatID      int64
-	UserID      int64
-	StatusMsgID int64
-	Folder      string
-	Quality     string
-	Format      string
-	SubmittedAt time.Time
+	Token        string
+	URL          string
+	ChatID       int64
+	UserID       int64
+	StatusMsgID  int64
+	Folder       string
+	Quality      string
+	Format       string
+	SubmittedAt  time.Time
+	LastPercent  float64
+	MeTubeItemID string
+}
+
+// DeliveredMeTubeItem tracks a MeTube item delivered to Telegram so the user can delete or keep it.
+type DeliveredMeTubeItem struct {
+	Token     string
+	ItemID    string
+	URL       string
+	Folder    string
+	Filename  string
+	ChatID    int64
+	UserID    int64
+	MessageID int64
+	CreatedAt time.Time
 }
 
 // FailedMeTubeJob holds state for a failed MeTube download to allow retry or cancel.
@@ -104,6 +122,7 @@ type Bot struct {
 	torrServerFailCount  int
 	activeMeTubeJobs     []ActiveMeTubeJob
 	failedMeTubeJobs     map[string]*FailedMeTubeJob
+	deliveredMeTubeItems map[string]*DeliveredMeTubeItem
 }
 
 // NewBot constructs a Bot instance with all dependent clients.
@@ -136,6 +155,7 @@ func NewBot(cfg *config.Config, logger *slog.Logger) (*Bot, error) {
 		torrServerMsgIDs:     make(map[string][]PendingDeletion),
 		activeMeTubeJobs:     make([]ActiveMeTubeJob, 0),
 		failedMeTubeJobs:     make(map[string]*FailedMeTubeJob),
+		deliveredMeTubeItems: make(map[string]*DeliveredMeTubeItem),
 	}, nil
 }
 
@@ -289,17 +309,33 @@ func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
 	}
 
 	if isTorrentURL(text) {
+		cleanURL := strings.TrimSpace(strings.Trim(strings.TrimSpace(text), "<>[]()\"'"))
+		b.logger.Info("Downloading .torrent file from link", "url", cleanURL)
+		data, fName, err := downloadTorrentBytes(ctx, cleanURL)
+		if err != nil {
+			b.logger.Error("Failed to download .torrent from link", "url", cleanURL, "err", err)
+			_, _ = b.tg.SendMessage(ctx, chatID, fmt.Sprintf("❌ Failed to download `.torrent` file from link:\n`%s`", telegram.EscapeMarkdown(err.Error())), "Markdown", nil)
+			return
+		}
+		if !isTorrentData(data) {
+			b.logger.Warn("Downloaded file from torrent link is not valid bencode torrent", "url", cleanURL, "size", len(data))
+			_, _ = b.tg.SendMessage(ctx, chatID, "❌ The link did not return a valid `.torrent` file.", "Markdown", nil)
+			return
+		}
+
 		b.mu.Lock()
 		b.pendingDownloads[chatID] = &PendingDownload{
-			Type:    "torrent_url",
-			URL:     text,
-			DiskIdx: b.cfg.DefaultDiskIdx,
-			UserID:  userID,
-			Expires: time.Now().Unix() + PendingDownloadExpirySecs,
+			Type:     "file",
+			FileName: fName,
+			FileData: data,
+			DiskIdx:  b.cfg.DefaultDiskIdx,
+			UserID:   userID,
+			Expires:  time.Now().Unix() + PendingDownloadExpirySecs,
 		}
 		b.mu.Unlock()
 
-		replyMsg, _ := b.tg.SendMessage(ctx, chatID, "🔗 *Torrent link detected.* Choose destination:", "Markdown", b.categoryKeyboard(b.cfg.DefaultDiskIdx))
+		safeName := telegram.EscapeMarkdown(fName)
+		replyMsg, _ := b.tg.SendMessage(ctx, chatID, fmt.Sprintf("📥 Torrent file downloaded: `%s`\nChoose destination:", safeName), "Markdown", b.categoryKeyboard(b.cfg.DefaultDiskIdx))
 		if replyMsg != nil {
 			_ = b.tg.DeleteMessage(ctx, chatID, m.MessageID)
 		}
@@ -445,6 +481,11 @@ func (b *Bot) handleCallback(ctx context.Context, cb *telegram.CallbackQuery) {
 		return
 	}
 
+	if data == "noop" {
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "", false)
+		return
+	}
+
 	if strings.HasPrefix(data, "mt_retry:") {
 		token := strings.TrimPrefix(data, "mt_retry:")
 		b.handleMeTubeRetry(ctx, cb, token)
@@ -454,6 +495,24 @@ func (b *Bot) handleCallback(ctx context.Context, cb *telegram.CallbackQuery) {
 	if strings.HasPrefix(data, "mt_cancel:") {
 		token := strings.TrimPrefix(data, "mt_cancel:")
 		b.handleMeTubeCancel(ctx, cb, token)
+		return
+	}
+
+	if strings.HasPrefix(data, "mt_cancel_active:") {
+		token := strings.TrimPrefix(data, "mt_cancel_active:")
+		b.handleMeTubeCancelActive(ctx, cb, token)
+		return
+	}
+
+	if strings.HasPrefix(data, "mt_del_file:") {
+		token := strings.TrimPrefix(data, "mt_del_file:")
+		b.handleMeTubeDeleteFile(ctx, cb, token)
+		return
+	}
+
+	if strings.HasPrefix(data, "mt_keep_file:") {
+		token := strings.TrimPrefix(data, "mt_keep_file:")
+		b.handleMeTubeKeepFile(ctx, cb, token)
 		return
 	}
 
@@ -694,25 +753,33 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 		}
 
 	case "torrent_url":
-		torrentURL := p.URL
-		if torrentURL == "" {
-			torrentURL = p.Magnet
-		}
-
+		var fileData []byte = p.FileData
+		var fName string = p.FileName
 		var addErr error
-		data, fName, fetchErr := downloadTorrentBytes(ctx, torrentURL)
-		if fetchErr == nil && isTorrentData(data) {
-			b.logger.Info("Downloaded .torrent file, uploading to qBittorrent", "filename", fName, "bytes", len(data))
-			addErr = b.qb.AddTorrentFile(ctx, fName, data, targetDir, catKey)
-		} else {
-			if fetchErr != nil {
-				b.logger.Warn("Could not download .torrent file directly, passing URL to qBittorrent", "url", torrentURL, "err", fetchErr)
+		if len(fileData) == 0 {
+			torrentURL := p.URL
+			if torrentURL == "" {
+				torrentURL = p.Magnet
 			}
-			addErr = b.qb.AddMagnet(ctx, torrentURL, targetDir, catKey)
+			data, fn, fetchErr := downloadTorrentBytes(ctx, torrentURL)
+			if fetchErr == nil && isTorrentData(data) {
+				fileData = data
+				fName = fn
+			} else if fetchErr != nil {
+				b.logger.Warn("Could not download .torrent file directly, passing URL to qBittorrent", "url", torrentURL, "err", fetchErr)
+				addErr = b.qb.AddMagnet(ctx, torrentURL, targetDir, catKey)
+			}
+		}
+		if len(fileData) > 0 {
+			if fName == "" {
+				fName = "download.torrent"
+			}
+			b.logger.Info("Uploading .torrent file to qBittorrent", "filename", fName, "bytes", len(fileData))
+			addErr = b.qb.AddTorrentFile(ctx, fName, fileData, targetDir, catKey)
 		}
 
 		if addErr != nil {
-			b.logger.Error("Failed to add torrent URL to qBittorrent", "err", addErr)
+			b.logger.Error("Failed to add torrent to qBittorrent", "err", addErr)
 			msgText = fmt.Sprintf("❌ Failed to add torrent to qBit: %s", addErr.Error())
 		} else {
 			msgText = fmt.Sprintf("✅ Torrent added to qBit.\nDir: `%s`", targetDir)
@@ -760,8 +827,10 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 			return
 		}
 
-		msgText = fmt.Sprintf("⏳ *Starting download on MeTube!*\nQuality: `%s` (%s)\n\n_The bot will send the video file directly to you here once completed._",
-			quality, p.MeTubeFormat)
+		token := fmt.Sprintf("%x", time.Now().UnixNano())
+		bar := renderProgressBar(0, 10)
+		msgText = fmt.Sprintf("⏳ *Starting download on MeTube!*\nQuality: `%s` (%s)\n\n%s 0.0%%\n\n_The bot will send the video file directly to you here once completed._",
+			quality, p.MeTubeFormat, bar)
 		success = true
 
 		// Trigger Jellyfin library refresh if enabled
@@ -771,26 +840,55 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 			}()
 		}
 
+		sentMsg, err := b.tg.SendMessage(ctx, chatID, msgText, "Markdown", b.meTubeCancelKeyboard(token))
+		if err == nil && sentMsg != nil {
+			b.mu.Lock()
+			b.activeMeTubeJobs = append(b.activeMeTubeJobs, ActiveMeTubeJob{
+				Token:       token,
+				URL:         p.URL,
+				ChatID:      chatID,
+				UserID:      p.UserID,
+				StatusMsgID: sentMsg.MessageID,
+				Folder:      catKey,
+				Quality:     quality,
+				Format:      p.MeTubeFormat,
+				SubmittedAt: time.Now(),
+				LastPercent: 0,
+			})
+			b.mu.Unlock()
+		}
+		return
+
 	case "file", "video", "photo":
-		fileInfo, err := b.tg.GetFile(ctx, p.FileID)
-		if err != nil {
-			b.logger.Error("Could not get file info from Telegram", "err", err)
-			msgText = "❌ Could not get file from Telegram (Check 20MB limit)."
-			break
+		var fileData []byte
+		var fName string = p.FileName
+		if len(p.FileData) > 0 {
+			fileData = p.FileData
+		} else {
+			fileInfo, err := b.tg.GetFile(ctx, p.FileID)
+			if err != nil {
+				b.logger.Error("Could not get file info from Telegram", "err", err)
+				msgText = "❌ Could not get file from Telegram (Check 20MB limit)."
+				break
+			}
+
+			_, _ = b.tg.SendMessage(ctx, chatID, "📥 Downloading file from Telegram...", "Markdown", nil)
+
+			var dlErr error
+			fileData, dlErr = b.tg.DownloadFile(ctx, fileInfo.FilePath)
+			if dlErr != nil {
+				b.logger.Error("Could not download file data from Telegram", "err", dlErr)
+				msgText = "❌ Failed to download file from Telegram."
+				break
+			}
 		}
 
-		_, _ = b.tg.SendMessage(ctx, chatID, "📥 Downloading file from Telegram...", "Markdown", nil)
-
-		fileData, err := b.tg.DownloadFile(ctx, fileInfo.FilePath)
-		if err != nil {
-			b.logger.Error("Could not download file data from Telegram", "err", err)
-			msgText = "❌ Failed to download file from Telegram."
-			break
-		}
-
-		isTorrent := strings.HasSuffix(strings.ToLower(p.FileName), ".torrent")
+		isTorrent := strings.HasSuffix(strings.ToLower(fName), ".torrent") || isTorrentData(fileData)
 		if isTorrent {
-			err := b.qb.AddTorrentFile(ctx, p.FileName, fileData, targetDir, catKey)
+			if !strings.HasSuffix(strings.ToLower(fName), ".torrent") {
+				fName = fName + ".torrent"
+			}
+			err := b.qb.AddTorrentFile(ctx, fName, fileData, targetDir, catKey)
 			if err != nil {
 				b.logger.Error("Failed to upload torrent to qBittorrent", "err", err)
 				msgText = fmt.Sprintf("❌ Failed to add torrent to qBit: %s", err.Error())
@@ -800,7 +898,7 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 			}
 		} else {
 			// Save media directly to destination directory
-			cleanName := filepath.Base(p.FileName)
+			cleanName := filepath.Base(fName)
 			destPath := filepath.Join(targetDir, cleanName)
 			if err := os.WriteFile(destPath, fileData, 0644); err != nil {
 				b.logger.Error("Failed to save media file to disk", "err", err)
@@ -814,28 +912,13 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 
 	sentMsg, err := b.tg.SendMessage(ctx, chatID, msgText, "Markdown", nil)
 	if success && err == nil && sentMsg != nil {
-		if p.Type == "metube" {
-			b.mu.Lock()
-			b.activeMeTubeJobs = append(b.activeMeTubeJobs, ActiveMeTubeJob{
-				URL:         p.URL,
-				ChatID:      chatID,
-				UserID:      p.UserID,
-				StatusMsgID: sentMsg.MessageID,
-				Folder:      catKey,
-				Quality:     p.MeTubeQuality,
-				Format:      p.MeTubeFormat,
-				SubmittedAt: time.Now(),
-			})
-			b.mu.Unlock()
-		} else {
-			b.mu.Lock()
-			b.pendingDeletions = append(b.pendingDeletions, PendingDeletion{
-				ChatID:    chatID,
-				MessageID: sentMsg.MessageID,
-				Expires:   time.Now().Add(b.cfg.NotificationCleanupTime).Unix(),
-			})
-			b.mu.Unlock()
-		}
+		b.mu.Lock()
+		b.pendingDeletions = append(b.pendingDeletions, PendingDeletion{
+			ChatID:    chatID,
+			MessageID: sentMsg.MessageID,
+			Expires:   time.Now().Add(b.cfg.NotificationCleanupTime).Unix(),
+		})
+		b.mu.Unlock()
 	}
 }
 
@@ -1517,6 +1600,27 @@ func (b *Bot) meTubeErrorKeyboard(token string) *telegram.InlineKeyboardMarkup {
 	}
 }
 
+func (b *Bot) meTubeCancelKeyboard(token string) *telegram.InlineKeyboardMarkup {
+	return &telegram.InlineKeyboardMarkup{
+		InlineKeyboard: [][]telegram.InlineKeyboardButton{
+			{
+				{Text: "❌ Cancel", CallbackData: "mt_cancel_active:" + token},
+			},
+		},
+	}
+}
+
+func (b *Bot) meTubeVideoKeyboard(token string) *telegram.InlineKeyboardMarkup {
+	return &telegram.InlineKeyboardMarkup{
+		InlineKeyboard: [][]telegram.InlineKeyboardButton{
+			{
+				{Text: "🗑 Delete from MeTube", CallbackData: "mt_del_file:" + token},
+				{Text: "💾 Keep in MeTube", CallbackData: "mt_keep_file:" + token},
+			},
+		},
+	}
+}
+
 func (b *Bot) handleMeTubeRetry(ctx context.Context, cb *telegram.CallbackQuery, token string) {
 	chatID := cb.Message.Chat.ID
 	callerID := cb.From.ID
@@ -1539,7 +1643,7 @@ func (b *Bot) handleMeTubeRetry(ctx context.Context, cb *telegram.CallbackQuery,
 
 	// Clean up old failed item from MeTube if it exists
 	go func(itemID, itemURL string) {
-		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL)
+		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, false)
 	}(job.ItemID, job.URL)
 
 	quality := job.Quality
@@ -1570,9 +1674,11 @@ func (b *Bot) handleMeTubeRetry(ctx context.Context, cb *telegram.CallbackQuery,
 		return
 	}
 
+	newToken := fmt.Sprintf("%x", time.Now().UnixNano())
 	b.mu.Lock()
 	delete(b.failedMeTubeJobs, token)
 	b.activeMeTubeJobs = append(b.activeMeTubeJobs, ActiveMeTubeJob{
+		Token:       newToken,
 		URL:         job.URL,
 		ChatID:      chatID,
 		UserID:      callerID,
@@ -1581,12 +1687,14 @@ func (b *Bot) handleMeTubeRetry(ctx context.Context, cb *telegram.CallbackQuery,
 		Quality:     job.Quality,
 		Format:      job.Format,
 		SubmittedAt: time.Now(),
+		LastPercent: 0,
 	})
 	b.mu.Unlock()
 
-	retryingText := fmt.Sprintf("⏳ *Retrying download on MeTube!*\nQuality: `%s` (%s)\n\n_The bot will send the video file directly to you here once completed._",
-		quality, job.Format)
-	_ = b.tg.EditMessageText(ctx, chatID, cb.Message.MessageID, retryingText, "Markdown", nil)
+	bar := renderProgressBar(0, 10)
+	retryingText := fmt.Sprintf("⏳ *Starting download on MeTube!*\nQuality: `%s` (%s)\n\n%s 0.0%%\n\n_The bot will send the video file directly to you here once completed._",
+		quality, job.Format, bar)
+	_ = b.tg.EditMessageText(ctx, chatID, cb.Message.MessageID, retryingText, "Markdown", b.meTubeCancelKeyboard(newToken))
 }
 
 func (b *Bot) handleMeTubeCancel(ctx context.Context, cb *telegram.CallbackQuery, token string) {
@@ -1614,10 +1722,122 @@ func (b *Bot) handleMeTubeCancel(ctx context.Context, cb *telegram.CallbackQuery
 	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "🗑 Removed", false)
 
 	go func(itemID, itemURL string) {
-		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL)
+		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, true)
 	}(job.ItemID, job.URL)
 
 	_ = b.tg.DeleteMessage(ctx, chatID, cb.Message.MessageID)
+}
+
+func (b *Bot) handleMeTubeCancelActive(ctx context.Context, cb *telegram.CallbackQuery, token string) {
+	chatID := cb.Message.Chat.ID
+	callerID := cb.From.ID
+
+	b.mu.Lock()
+	var targetJob *ActiveMeTubeJob
+	newJobs := make([]ActiveMeTubeJob, 0, len(b.activeMeTubeJobs))
+	for _, j := range b.activeMeTubeJobs {
+		if j.Token == token {
+			copyJ := j
+			targetJob = &copyJ
+		} else {
+			newJobs = append(newJobs, j)
+		}
+	}
+	if targetJob != nil {
+		b.activeMeTubeJobs = newJobs
+	}
+	b.mu.Unlock()
+
+	if targetJob == nil {
+		_ = b.tg.DeleteMessage(ctx, chatID, cb.Message.MessageID)
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "Download expired or already completed.", false)
+		return
+	}
+
+	if !b.cfg.IsUserAllowed(callerID) && targetJob.UserID != callerID {
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "Not authorized.", true)
+		return
+	}
+
+	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "❌ Cancelled", false)
+
+	go func(itemID, itemURL string) {
+		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, true)
+	}(targetJob.MeTubeItemID, targetJob.URL)
+
+	_ = b.tg.DeleteMessage(ctx, chatID, cb.Message.MessageID)
+}
+
+func (b *Bot) handleMeTubeDeleteFile(ctx context.Context, cb *telegram.CallbackQuery, token string) {
+	chatID := cb.Message.Chat.ID
+	callerID := cb.From.ID
+
+	b.mu.Lock()
+	item, exists := b.deliveredMeTubeItems[token]
+	if exists {
+		delete(b.deliveredMeTubeItems, token)
+	}
+	b.mu.Unlock()
+
+	if !exists {
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "Action expired or already processed.", true)
+		_ = b.tg.EditMessageReplyMarkup(ctx, chatID, cb.Message.MessageID, nil)
+		return
+	}
+
+	if !b.cfg.IsUserAllowed(callerID) && item.UserID != callerID {
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "Not authorized.", true)
+		return
+	}
+
+	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "🗑 Deleting from MeTube...", false)
+
+	go func(itemID, itemURL string) {
+		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, true)
+	}(item.ItemID, item.URL)
+
+	doneKb := &telegram.InlineKeyboardMarkup{
+		InlineKeyboard: [][]telegram.InlineKeyboardButton{
+			{
+				{Text: "🗑 Deleted from MeTube", CallbackData: "noop"},
+			},
+		},
+	}
+	_ = b.tg.EditMessageReplyMarkup(ctx, chatID, cb.Message.MessageID, doneKb)
+}
+
+func (b *Bot) handleMeTubeKeepFile(ctx context.Context, cb *telegram.CallbackQuery, token string) {
+	chatID := cb.Message.Chat.ID
+	callerID := cb.From.ID
+
+	b.mu.Lock()
+	item, exists := b.deliveredMeTubeItems[token]
+	if exists {
+		delete(b.deliveredMeTubeItems, token)
+	}
+	b.mu.Unlock()
+
+	if !exists {
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "Action expired or already processed.", true)
+		_ = b.tg.EditMessageReplyMarkup(ctx, chatID, cb.Message.MessageID, nil)
+		return
+	}
+
+	if !b.cfg.IsUserAllowed(callerID) && item.UserID != callerID {
+		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "Not authorized.", true)
+		return
+	}
+
+	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "💾 Kept in MeTube", false)
+
+	keptKb := &telegram.InlineKeyboardMarkup{
+		InlineKeyboard: [][]telegram.InlineKeyboardButton{
+			{
+				{Text: "💾 Kept in MeTube", CallbackData: "noop"},
+			},
+		},
+	}
+	_ = b.tg.EditMessageReplyMarkup(ctx, chatID, cb.Message.MessageID, keptKb)
 }
 
 func (b *Bot) checkMeTubeCompletions(ctx context.Context) {
@@ -1638,6 +1858,7 @@ func (b *Bot) checkMeTubeCompletions(ctx context.Context) {
 	for _, job := range jobs {
 		var doneItem *metube.HistoryItem
 		var errorItem *metube.HistoryItem
+		var queueItem *metube.HistoryItem
 
 		// Check done items
 		for _, item := range hist.Done {
@@ -1660,7 +1881,7 @@ func (b *Bot) checkMeTubeCompletions(ctx context.Context) {
 			}
 		}
 
-		// Also check queue items for errors if not found in done
+		// Also check queue items for errors or active download progress
 		if doneItem == nil && errorItem == nil {
 			for _, item := range hist.Queue {
 				matches := item.URL == job.URL || (item.ID != "" && strings.Contains(job.URL, item.ID))
@@ -1671,6 +1892,8 @@ func (b *Bot) checkMeTubeCompletions(ctx context.Context) {
 					errorItem = &item
 					break
 				}
+				queueItem = &item
+				break
 			}
 		}
 
@@ -1685,7 +1908,7 @@ func (b *Bot) checkMeTubeCompletions(ctx context.Context) {
 			b.removeActiveMeTubeJob(job.URL)
 			b.mu.Unlock()
 
-			// Delete the initial "Starting download on MeTube!" confirmation message if present
+			// Delete the initial confirmation message if present
 			if job.StatusMsgID != 0 {
 				_ = b.tg.DeleteMessage(ctx, job.ChatID, job.StatusMsgID)
 			}
@@ -1716,6 +1939,49 @@ func (b *Bot) checkMeTubeCompletions(ctx context.Context) {
 		}
 
 		if doneItem == nil {
+			if queueItem != nil && job.StatusMsgID != 0 {
+				if queueItem.ID != "" && job.MeTubeItemID != queueItem.ID {
+					b.mu.Lock()
+					for i := range b.activeMeTubeJobs {
+						if b.activeMeTubeJobs[i].Token == job.Token {
+							b.activeMeTubeJobs[i].MeTubeItemID = queueItem.ID
+							break
+						}
+					}
+					b.mu.Unlock()
+					job.MeTubeItemID = queueItem.ID
+				}
+
+				percent := queueItem.Percent
+				if percent < 0 {
+					percent = 0
+				}
+				if percent > 100 {
+					percent = 100
+				}
+
+				diff := math.Abs(percent - job.LastPercent)
+				if diff >= 5 || (job.LastPercent == 0 && percent > 0) {
+					bar := renderProgressBar(percent/100.0, 10)
+					titleLine := ""
+					if queueItem.Title != "" {
+						titleLine = fmt.Sprintf("🎬 *%s*\n", telegram.EscapeMarkdown(queueItem.Title))
+					}
+					progressText := fmt.Sprintf("⏳ *Downloading on MeTube...*\n%sQuality: `%s` (%s)\n\n%s %.1f%%\n\n_The bot will send the video file directly to you here once completed._",
+						titleLine, job.Quality, job.Format, bar, percent)
+					_ = b.tg.EditMessageText(ctx, job.ChatID, job.StatusMsgID, progressText, "Markdown", b.meTubeCancelKeyboard(job.Token))
+
+					b.mu.Lock()
+					for i := range b.activeMeTubeJobs {
+						if b.activeMeTubeJobs[i].Token == job.Token {
+							b.activeMeTubeJobs[i].LastPercent = percent
+							break
+						}
+					}
+					b.mu.Unlock()
+				}
+			}
+
 			if time.Since(job.SubmittedAt) > 30*time.Minute {
 				b.mu.Lock()
 				b.removeActiveMeTubeJob(job.URL)
@@ -1746,10 +2012,35 @@ func (b *Bot) deliverMeTubeFile(job ActiveMeTubeJob, item metube.HistoryItem) {
 		title = item.Filename
 	}
 
-	// Delete the initial "Starting download on MeTube!" confirmation message if present
+	// Delete the initial status message if present
 	if job.StatusMsgID != 0 {
 		_ = b.tg.DeleteMessage(ctx, job.ChatID, job.StatusMsgID)
 	}
+
+	cleanFileName := item.Filename
+	if cleanFileName == "" {
+		cleanFileName = "video.mp4"
+		if strings.ToLower(item.DownloadType) == "audio" {
+			cleanFileName = "audio.mp3"
+		}
+	}
+
+	token := fmt.Sprintf("%x", time.Now().UnixNano())
+	delItem := &DeliveredMeTubeItem{
+		Token:     token,
+		ItemID:    item.ID,
+		URL:       item.URL,
+		Folder:    item.Folder,
+		Filename:  cleanFileName,
+		ChatID:    job.ChatID,
+		UserID:    job.UserID,
+		CreatedAt: time.Now(),
+	}
+	b.mu.Lock()
+	b.deliveredMeTubeItems[token] = delItem
+	b.mu.Unlock()
+
+	mediaKb := b.meTubeVideoKeyboard(token)
 
 	maxUploadMB := b.cfg.TelegramMaxUploadMB
 	if maxUploadMB <= 0 {
@@ -1765,7 +2056,12 @@ func (b *Bot) deliverMeTubeFile(job ActiveMeTubeJob, item metube.HistoryItem) {
 		}
 		msg := fmt.Sprintf("✅ *Download Complete on MeTube!*\n\n🎬 *%s*\n📦 Size: *%.1f MB*\n\n⚠️ _File exceeds Telegram's %dMB upload limit._\n%s",
 			telegram.EscapeMarkdown(title), sizeMb, maxUploadMB, links)
-		_, _ = b.tg.SendMessage(ctx, job.ChatID, msg, "Markdown", nil)
+		sentMsg, _ := b.tg.SendMessage(ctx, job.ChatID, msg, "Markdown", mediaKb)
+		if sentMsg != nil {
+			b.mu.Lock()
+			delItem.MessageID = sentMsg.MessageID
+			b.mu.Unlock()
+		}
 		return
 	}
 
@@ -1785,29 +2081,28 @@ func (b *Bot) deliverMeTubeFile(job ActiveMeTubeJob, item metube.HistoryItem) {
 		return
 	}
 
-	cleanFileName := item.Filename
-	if cleanFileName == "" {
-		cleanFileName = "video.mp4"
-		if strings.ToLower(item.DownloadType) == "audio" {
-			cleanFileName = "audio.mp3"
-		}
-	}
-
 	caption := fmt.Sprintf("🎬 %s", title)
+	var sentMediaMsg *telegram.Message
 	if strings.ToLower(item.DownloadType) == "audio" {
 		caption = fmt.Sprintf("🎵 %s", title)
-		_, err = b.tg.SendAudio(ctx, job.ChatID, cleanFileName, data, caption)
+		sentMediaMsg, err = b.tg.SendAudio(ctx, job.ChatID, cleanFileName, data, caption, mediaKb)
 	} else {
-		_, err = b.tg.SendVideo(ctx, job.ChatID, cleanFileName, data, caption)
+		sentMediaMsg, err = b.tg.SendVideo(ctx, job.ChatID, cleanFileName, data, caption, mediaKb)
 	}
 
 	if err != nil {
 		b.logger.Warn("Failed to send video/audio directly, trying as document", "err", err)
-		_, err = b.tg.SendDocument(ctx, job.ChatID, cleanFileName, data, caption)
+		sentMediaMsg, err = b.tg.SendDocument(ctx, job.ChatID, cleanFileName, data, caption, mediaKb)
 	}
 
 	if statusMsg != nil {
 		_ = b.tg.DeleteMessage(ctx, job.ChatID, statusMsg.MessageID)
+	}
+
+	if sentMediaMsg != nil {
+		b.mu.Lock()
+		delItem.MessageID = sentMediaMsg.MessageID
+		b.mu.Unlock()
 	}
 
 	if err != nil {

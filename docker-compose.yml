@@ -3,39 +3,98 @@ services:
     image: ghcr.io/az2oo1/telegram-bot-qbittorrent-metube:latest
     container_name: qbot
     restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      # Data directory for persistent bot state and logs
-      - ./data:/app/data
-
-      # Optional: Mount download storage directories configured in your .env DISKS setting
-      - /mnt/ftp:/mnt/ftp
-      - /mnt/ftp2:/mnt/ftp2
-
     network_mode: host
 
-    # Environment variables (optional overrides)
+    # Optional: Reads .env file if it exists, but will not fail if missing (Portainer friendly)
+    env_file:
+      - path: .env
+        required: false
+
+    volumes:
+      # Data directory for persistent bot state and logs (required)
+      - ./data:/app/data
+
+      # Storage directory: mount your download folder(s) here
+      # Format: <host_directory>:<container_directory>
+      - /mnt/storage1/Downloads/:/mnt/storage1/Downloads/
+
     environment:
       - TZ=UTC
 
-  # Official Local Telegram Bot API Server (Enables up to 2 GB file upload/download limits)
-  # To run: get TELEGRAM_API_ID & TELEGRAM_API_HASH from https://my.telegram.org,
-  # fill them in .env, set TELEGRAM_API_URL=http://127.0.0.1:8082, and run:
-  #   docker compose --profile local-api up -d
-  # (or uncomment COMPOSE_PROFILES=local-api in .env)
-  telegram-bot-api:
-    image: aiogram/telegram-bot-api:latest
-    container_name: telegram-bot-api
-    restart: unless-stopped
-    profiles:
-      - local-api
-    environment:
-      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
-      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
-      TELEGRAM_LOCAL: "true"
-      TELEGRAM_STAT: "true"
-    ports:
-      - "8082:8081"
-    volumes:
-      - ./data/telegram-bot-api:/var/lib/telegram-bot-api
+      # ============================================================
+      # 1. Telegram Settings (REQUIRED)
+      # ============================================================
+      # Your Telegram Bot Token from @BotFather
+      - BOT_TOKEN=${BOT_TOKEN:-}
+
+      # Your numeric Telegram User ID from @userinfobot (comma-separated for multiple admins)
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-}
+
+      # ============================================================
+      # 2. qBittorrent Settings
+      # ============================================================
+      - QB_URL=${QB_URL:-http://127.0.0.1:8080}
+      - QB_USER=${QB_USER:-admin}
+      - QB_PASS=${QB_PASS:-adminadmin}
+
+      # Action on torrent completion: 'stop', 'remove', or 'remove_data'
+      - ACTION_ON_COMPLETE=${ACTION_ON_COMPLETE:-stop}
+
+      # ============================================================
+      # 3. Storage Disks & Categories
+      # ============================================================
+      # Comma-separated paths matching the volumes mounted above
+      - DISKS=${DISKS:-/mnt/storage1/Downloads/}
+      - DEFAULT_DISK_IDX=${DEFAULT_DISK_IDX:-0}
+
+      # Category folders (optional labels)
+      - CATEGORIES=${CATEGORIES:-tv:📺 Series,movies:🎬 Movies,download-pc:📁 Other,Music:🎵 Music,photo:🖼 Photo,vidcontent:🎬 Videos}
+
+      # ============================================================
+      # 4. MeTube Integration (Video & Audio Downloads)
+      # ============================================================
+      - METUBE_ENABLED=${METUBE_ENABLED:-true}
+      - METUBE_URL=${METUBE_URL:-http://127.0.0.1:8081}
+      - METUBE_PUBLIC_URL=${METUBE_PUBLIC_URL:-}
+      - METUBE_DEFAULT_QUALITY=${METUBE_DEFAULT_QUALITY:-best}
+
+      # ============================================================
+      # 5. Local Telegram Bot API (Optional - Enables 2 GB Uploads)
+      # ============================================================
+      # Leave empty to use Telegram Cloud API (50 MB limit).
+      # Set to http://127.0.0.1:8082 if running the telegram-bot-api service below.
+      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-}
+      - TELEGRAM_MAX_UPLOAD_MB=${TELEGRAM_MAX_UPLOAD_MB:-50}
+
+      # ============================================================
+      # 6. Jellyfin Integration (Optional - Library Refresh)
+      # ============================================================
+      - JELLYFIN_ENABLED=${JELLYFIN_ENABLED:-false}
+      - JELLYFIN_URL=${JELLYFIN_URL:-http://127.0.0.1:8096}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
+
+      # ============================================================
+      # 7. TorrServer Integration (Optional)
+      # ============================================================
+      - TORRSERVER_ENABLED=${TORRSERVER_ENABLED:-false}
+      - TORRSERVER_URL=${TORRSERVER_URL:-http://127.0.0.1:8090}
+      - TORRSERVER_DL_LIMIT_MBIT=${TORRSERVER_DL_LIMIT_MBIT:-100}
+
+  # ------------------------------------------------------------
+  # Local Telegram Bot API Server (Optional)
+  # Uncomment/keep this service if you want to bypass Telegram's
+  # 50 MB upload limit and allow up to 2 GB (2000 MB) uploads!
+  # Requires API ID & HASH from https://my.telegram.org
+  # ------------------------------------------------------------
+  # telegram-bot-api:
+  #   image: aiogram/telegram-bot-api:latest
+  #   container_name: telegram-bot-api
+  #   restart: unless-stopped
+  #   environment:
+  #     TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+  #     TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+  #     TELEGRAM_LOCAL: "1"
+  #   ports:
+  #     - "8082:8081"
+  #   volumes:
+  #     - ./data/telegram-bot-api:/var/lib/telegram-bot-api

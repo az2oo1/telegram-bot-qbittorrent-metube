@@ -135,3 +135,41 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteByItemOrURL(t *testing.T) {
+	var receivedDel DeleteRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/history" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"done": [{"id": "item123", "url": "https://youtube.com/watch?v=123", "filename": "test.mp4"}],
+				"queue": []
+			}`))
+			return
+		}
+		if r.URL.Path == "/delete" {
+			if err := json.NewDecoder(r.Body).Decode(&receivedDel); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", nil)
+	err := c.DeleteByItemOrURL(context.Background(), "item123", "https://youtube.com/watch?v=123", true)
+	if err != nil {
+		t.Fatalf("DeleteByItemOrURL failed: %v", err)
+	}
+
+	if !receivedDel.DeleteFiles {
+		t.Errorf("expected DeleteFiles to be true, got false")
+	}
+	if len(receivedDel.IDs) == 0 || receivedDel.IDs[0] != "item123" {
+		t.Errorf("expected ID item123 to be deleted, got %+v", receivedDel.IDs)
+	}
+}
+

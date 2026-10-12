@@ -301,7 +301,7 @@ func (c *Client) Delete(ctx context.Context, ids []string, where string, deleteF
 }
 
 // DeleteByItemOrURL attempts to find and delete matching items from MeTube history (both done and queue).
-func (c *Client) DeleteByItemOrURL(ctx context.Context, id, targetURL string) error {
+func (c *Client) DeleteByItemOrURL(ctx context.Context, id, targetURL string, deleteFiles bool) error {
 	idsToDeleteDone := make([]string, 0)
 	idsToDeleteQueue := make([]string, 0)
 	if id != "" {
@@ -326,10 +326,10 @@ func (c *Client) DeleteByItemOrURL(ctx context.Context, id, targetURL string) er
 	}
 
 	if len(idsToDeleteDone) > 0 {
-		_ = c.Delete(ctx, idsToDeleteDone, "done", false)
+		_ = c.Delete(ctx, idsToDeleteDone, "done", deleteFiles)
 	}
 	if len(idsToDeleteQueue) > 0 {
-		_ = c.Delete(ctx, idsToDeleteQueue, "queue", false)
+		_ = c.Delete(ctx, idsToDeleteQueue, "queue", deleteFiles)
 	}
 	return nil
 }

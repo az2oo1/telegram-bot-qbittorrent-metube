@@ -184,8 +184,10 @@ func (c *Config) IsUserAllowed(userID int64) bool {
 }
 
 func getEnv(key, defaultVal string) string {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		return val
+	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
+		cleaned := strings.TrimSpace(val)
+		cleaned = strings.Trim(cleaned, "\"'")
+		return strings.TrimSpace(cleaned)
 	}
 	return defaultVal
 }

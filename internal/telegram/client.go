@@ -186,6 +186,19 @@ func (c *Client) EditMessageCaption(ctx context.Context, chatID int64, messageID
 	return err
 }
 
+// EditMessageReplyMarkup edits only the inline keyboard of an existing message.
+func (c *Client) EditMessageReplyMarkup(ctx context.Context, chatID int64, messageID int64, replyMarkup *InlineKeyboardMarkup) error {
+	params := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	if replyMarkup != nil {
+		params["reply_markup"] = replyMarkup
+	}
+	_, err := c.Request(ctx, "editMessageReplyMarkup", params)
+	return err
+}
+
 // DeleteMessage deletes a message from a chat.
 func (c *Client) DeleteMessage(ctx context.Context, chatID int64, messageID int64) error {
 	params := map[string]interface{}{
@@ -251,21 +264,21 @@ func (c *Client) DownloadFile(ctx context.Context, filePath string) ([]byte, err
 }
 
 // SendVideo uploads and sends a video file to the specified chat.
-func (c *Client) SendVideo(ctx context.Context, chatID int64, fileName string, fileData []byte, caption string) (*Message, error) {
-	return c.sendMediaFile(ctx, "sendVideo", "video", chatID, fileName, fileData, caption)
+func (c *Client) SendVideo(ctx context.Context, chatID int64, fileName string, fileData []byte, caption string, replyMarkup *InlineKeyboardMarkup) (*Message, error) {
+	return c.sendMediaFile(ctx, "sendVideo", "video", chatID, fileName, fileData, caption, replyMarkup)
 }
 
 // SendAudio uploads and sends an audio file to the specified chat.
-func (c *Client) SendAudio(ctx context.Context, chatID int64, fileName string, fileData []byte, caption string) (*Message, error) {
-	return c.sendMediaFile(ctx, "sendAudio", "audio", chatID, fileName, fileData, caption)
+func (c *Client) SendAudio(ctx context.Context, chatID int64, fileName string, fileData []byte, caption string, replyMarkup *InlineKeyboardMarkup) (*Message, error) {
+	return c.sendMediaFile(ctx, "sendAudio", "audio", chatID, fileName, fileData, caption, replyMarkup)
 }
 
 // SendDocument uploads and sends a general file/document to the specified chat.
-func (c *Client) SendDocument(ctx context.Context, chatID int64, fileName string, fileData []byte, caption string) (*Message, error) {
-	return c.sendMediaFile(ctx, "sendDocument", "document", chatID, fileName, fileData, caption)
+func (c *Client) SendDocument(ctx context.Context, chatID int64, fileName string, fileData []byte, caption string, replyMarkup *InlineKeyboardMarkup) (*Message, error) {
+	return c.sendMediaFile(ctx, "sendDocument", "document", chatID, fileName, fileData, caption, replyMarkup)
 }
 
-func (c *Client) sendMediaFile(ctx context.Context, endpoint, fieldName string, chatID int64, fileName string, fileData []byte, caption string) (*Message, error) {
+func (c *Client) sendMediaFile(ctx context.Context, endpoint, fieldName string, chatID int64, fileName string, fileData []byte, caption string, replyMarkup *InlineKeyboardMarkup) (*Message, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
@@ -283,6 +296,14 @@ func (c *Client) sendMediaFile(ctx context.Context, endpoint, fieldName string, 
 	if caption != "" {
 		if err := writer.WriteField("caption", caption); err != nil {
 			return nil, err
+		}
+	}
+	if replyMarkup != nil {
+		markupBytes, err := json.Marshal(replyMarkup)
+		if err == nil {
+			if err := writer.WriteField("reply_markup", string(markupBytes)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if endpoint == "sendVideo" {
