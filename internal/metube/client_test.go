@@ -81,3 +81,57 @@ func TestAddDownload(t *testing.T) {
 		t.Fatalf("unexpected request received by MeTube server: %+v", received)
 	}
 }
+
+func TestHistoryItemErrorMessage(t *testing.T) {
+	item1 := HistoryItem{Msg: "ERROR: unable to download video data: HTTP Error 403: Forbidden"}
+	if item1.ErrorMessage() != "ERROR: unable to download video data: HTTP Error 403: Forbidden" {
+		t.Errorf("expected msg error, got %s", item1.ErrorMessage())
+	}
+
+	item2 := HistoryItem{Error: "Some other error"}
+	if item2.ErrorMessage() != "Some other error" {
+		t.Errorf("expected error field, got %s", item2.ErrorMessage())
+	}
+
+	item3 := HistoryItem{}
+	if item3.ErrorMessage() != "" {
+		t.Errorf("expected empty string, got %s", item3.ErrorMessage())
+	}
+}
+
+func TestDelete(t *testing.T) {
+	var received DeleteRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/delete" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", nil)
+	err := c.Delete(context.Background(), []string{"test_id_1"}, "done", false)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	if len(received.IDs) != 1 || received.IDs[0] != "test_id_1" || received.Where != "done" {
+		t.Fatalf("unexpected delete payload: %+v", received)
+	}
+}
+

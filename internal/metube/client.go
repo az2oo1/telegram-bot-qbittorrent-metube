@@ -137,6 +137,19 @@ type HistoryItem struct {
 	Size         int64   `json:"size"`
 	Filename     string  `json:"filename"`
 	Timestamp    int64   `json:"timestamp"`
+	Msg          string  `json:"msg"`
+	Error        string  `json:"error"`
+}
+
+// ErrorMessage returns the error description if present.
+func (h HistoryItem) ErrorMessage() string {
+	if strings.TrimSpace(h.Msg) != "" {
+		return strings.TrimSpace(h.Msg)
+	}
+	if strings.TrimSpace(h.Error) != "" {
+		return strings.TrimSpace(h.Error)
+	}
+	return ""
 }
 
 // HistoryResponse represents the output of GET /history from MeTube.
@@ -235,3 +248,89 @@ func (c *Client) DownloadFile(ctx context.Context, downloadURL string) ([]byte, 
 
 	return io.ReadAll(resp.Body)
 }
+
+// DeleteRequest represents the payload expected by MeTube's /delete endpoint.
+type DeleteRequest struct {
+	IDs         []string `json:"ids"`
+	Where       string   `json:"where"` // "done" or "queue"
+	DeleteFiles bool     `json:"delete_files"`
+}
+
+// Delete removes items from MeTube queue or completed list via POST /delete.
+func (c *Client) Delete(ctx context.Context, ids []string, where string, deleteFiles bool) error {
+	if c.baseURL == "" {
+		return fmt.Errorf("MeTube URL is not configured")
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if where != "queue" && where != "done" {
+		where = "done"
+	}
+
+	reqBody := DeleteRequest{
+		IDs:         ids,
+		Where:       where,
+		DeleteFiles: deleteFiles,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal MeTube delete request: %w", err)
+	}
+
+	delURL := c.baseURL + "/delete"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, delURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create MeTube delete request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("failed to send delete request to MeTube: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("MeTube /delete returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	return nil
+}
+
+// DeleteByItemOrURL attempts to find and delete matching items from MeTube history (both done and queue).
+func (c *Client) DeleteByItemOrURL(ctx context.Context, id, targetURL string) error {
+	idsToDeleteDone := make([]string, 0)
+	idsToDeleteQueue := make([]string, 0)
+	if id != "" {
+		idsToDeleteDone = append(idsToDeleteDone, id)
+		idsToDeleteQueue = append(idsToDeleteQueue, id)
+	}
+
+	hist, err := c.GetHistory(ctx)
+	if err == nil && hist != nil {
+		for _, item := range hist.Done {
+			matches := (id != "" && item.ID == id) || (targetURL != "" && (item.URL == targetURL || (item.ID != "" && strings.Contains(targetURL, item.ID))))
+			if matches && item.ID != "" {
+				idsToDeleteDone = append(idsToDeleteDone, item.ID)
+			}
+		}
+		for _, item := range hist.Queue {
+			matches := (id != "" && item.ID == id) || (targetURL != "" && (item.URL == targetURL || (item.ID != "" && strings.Contains(targetURL, item.ID))))
+			if matches && item.ID != "" {
+				idsToDeleteQueue = append(idsToDeleteQueue, item.ID)
+			}
+		}
+	}
+
+	if len(idsToDeleteDone) > 0 {
+		_ = c.Delete(ctx, idsToDeleteDone, "done", false)
+	}
+	if len(idsToDeleteQueue) > 0 {
+		_ = c.Delete(ctx, idsToDeleteQueue, "queue", false)
+	}
+	return nil
+}
+
