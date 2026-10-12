@@ -42,14 +42,6 @@ type Config struct {
 	MeTubeDefaultQuality string
 	MeTubeDomains        []string
 
-	// TorrServer
-	TorrServerEnabled       bool
-	TorrServerURL           string
-	TorrServerCheckInterval time.Duration
-	TorrServerUser          string
-	TorrServerPass          string
-	TorrServerDLLimitMbit   int
-
 	// Jellyfin
 	JellyfinEnabled bool
 	JellyfinURL     string
@@ -136,12 +128,6 @@ func Load() (*Config, error) {
 		MeTubeDefaultQuality: getEnv("METUBE_DEFAULT_QUALITY", "best"),
 		MeTubeDomains:        parseCommaStringsWithDefault(getEnv("METUBE_DOMAINS", ""), DefaultDomains()),
 
-		TorrServerURL:           strings.TrimRight(getEnv("TORRSERVER_URL", "http://127.0.0.1:8090"), "/"),
-		TorrServerCheckInterval: time.Duration(getEnvInt("TORRSERVER_CHECK_INTERVAL", 60)) * time.Second,
-		TorrServerUser:          getEnv("TORRSERVER_USER", ""),
-		TorrServerPass:          getEnv("TORRSERVER_PASS", ""),
-		TorrServerDLLimitMbit:   getEnvInt("TORRSERVER_DL_LIMIT_MBIT", 100),
-
 		JellyfinURL:    strings.TrimRight(getEnv("JELLYFIN_URL", "http://127.0.0.1:8096"), "/"),
 		JellyfinAPIKey: getEnv("JELLYFIN_API_KEY", ""),
 
@@ -155,7 +141,6 @@ func Load() (*Config, error) {
 
 	// Boolean toggles
 	cfg.MeTubeEnabled = getEnvBool("METUBE_ENABLED", cfg.MeTubeURL != "")
-	cfg.TorrServerEnabled = getEnvBool("TORRSERVER_ENABLED", false)
 	cfg.JellyfinEnabled = getEnvBool("JELLYFIN_ENABLED", false)
 
 	if cfg.BotToken == "" {

@@ -8,7 +8,6 @@ Runs as a lightweight container depending **only on the Docker image and a `.env
 
 ![Adding torrent](img/screen1.png)
 ![status message](img/screen2.png)
-![torr new torrent](img/torr-new-torrent.jpg)
 
 ## ✨ Features
 
@@ -26,10 +25,6 @@ Runs as a lightweight container depending **only on the Docker image and a `.env
 - 💽 **Interactive Disk & Category Menus**:
   - Dynamically displays available free space (in GB) for each configured disk.
   - One-click category/directory selection.
-- 🎬 **TorrServer Integration (Optional)**:
-  - Rich notifications with posters, media file names, and sizes.
-  - One-click "Download to qBittorrent" or "Ignore".
-  - Automatic download speed limit enforcement for background downloads.
 - 🔒 **Security**: Whitelist protection via `ALLOWED_USER_IDS`.
 
 ---
@@ -99,12 +94,8 @@ METUBE_DEFAULT_QUALITY=best
 METUBE_DOMAINS=youtube.com,youtu.be,vimeo.com,twitter.com,x.com,instagram.com,tiktok.com,reddit.com,twitch.tv,dailymotion.com
 
 # ------------------------------------------------------------
-# Optional Integrations
+# Jellyfin Settings (Optional)
 # ------------------------------------------------------------
-TORRSERVER_ENABLED=false
-TORRSERVER_URL=http://127.0.0.1:8090
-TORRSERVER_DL_LIMIT_MBIT=100
-
 JELLYFIN_ENABLED=false
 JELLYFIN_URL=http://127.0.0.1:8096
 JELLYFIN_API_KEY=
@@ -173,5 +164,5 @@ If you prefer to run the native Go binary:
 - **Send a `.torrent` file** → Uploads torrent to qBittorrent and starts downloading.
 - **Send a video URL** (YouTube, Vimeo, Twitter/X, TikTok, etc.) → Prompts format (Video/Audio) and category, then sends to MeTube.
 - **Send media directly (photo / video up to 20MB)** → Saves file directly to the chosen storage directory.
-- `/status` → Shows current qBittorrent downloads with progress and links to WebUIs (qBittorrent, MeTube, TorrServer, Jellyfin).
+- `/status` → Shows current qBittorrent downloads with progress and links to WebUIs (qBittorrent, MeTube, Jellyfin).
 - `/start` or `/help` → Bot information, features, and disk storage stats.

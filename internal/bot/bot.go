@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,12 +24,10 @@ import (
 	"github.com/dominatos/qbittorrent-telegram-bot/internal/qbittorrent"
 	"github.com/dominatos/qbittorrent-telegram-bot/internal/state"
 	"github.com/dominatos/qbittorrent-telegram-bot/internal/telegram"
-	"github.com/dominatos/qbittorrent-telegram-bot/internal/torrserver"
 )
 
 const (
 	Version                    = "2.0.0"
-	MaxPendingLimitAttempts    = 5
 	PendingDownloadExpirySecs  = 600
 	TelegramFileLimitBytes     = 20 * 1024 * 1024 // 20 MB
 )
@@ -46,7 +43,6 @@ type PendingDownload struct {
 	DiskIdx       int
 	MeTubeFormat  string // "video" or "audio"
 	MeTubeQuality string // "best", "1080p", "720p", "480p"
-	Source        string // e.g. "torrserver"
 	UserID        int64
 	Expires       int64
 }
@@ -103,13 +99,12 @@ type PendingDeletion struct {
 
 // Bot is the main orchestrator for qbittorrent-telegram-bot.
 type Bot struct {
-	cfg        *config.Config
-	state      *state.State
-	tg         *telegram.Client
-	qb         *qbittorrent.Client
-	metube     *metube.Client
-	torrserver *torrserver.Client
-	jellyfin   *jellyfin.Client
+	cfg      *config.Config
+	state    *state.State
+	tg       *telegram.Client
+	qb       *qbittorrent.Client
+	metube   *metube.Client
+	jellyfin *jellyfin.Client
 
 	logger *slog.Logger
 
@@ -118,8 +113,6 @@ type Bot struct {
 	pendingDeletions     []PendingDeletion
 	lastStatusMessageIDs map[int64][]int64
 	statusCancelFuncs    map[int64]context.CancelFunc
-	torrServerMsgIDs     map[string][]PendingDeletion // hash -> []{chatID, messageID}
-	torrServerFailCount  int
 	activeMeTubeJobs     []ActiveMeTubeJob
 	failedMeTubeJobs     map[string]*FailedMeTubeJob
 	deliveredMeTubeItems map[string]*DeliveredMeTubeItem
@@ -136,7 +129,6 @@ func NewBot(cfg *config.Config, logger *slog.Logger) (*Bot, error) {
 	}
 
 	mt := metube.NewClient(cfg.MeTubeURL, cfg.MeTubePublicURL, cfg.MeTubeDomains)
-	ts := torrserver.NewClient(cfg.TorrServerURL, cfg.TorrServerUser, cfg.TorrServerPass)
 	jf := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey)
 
 	return &Bot{
@@ -145,14 +137,12 @@ func NewBot(cfg *config.Config, logger *slog.Logger) (*Bot, error) {
 		tg:                   tg,
 		qb:                   qb,
 		metube:               mt,
-		torrserver:           ts,
 		jellyfin:             jf,
 		logger:               logger,
 		pendingDownloads:     make(map[int64]*PendingDownload),
 		pendingDeletions:     make([]PendingDeletion, 0),
 		lastStatusMessageIDs: make(map[int64][]int64),
 		statusCancelFuncs:    make(map[int64]context.CancelFunc),
-		torrServerMsgIDs:     make(map[string][]PendingDeletion),
 		activeMeTubeJobs:     make([]ActiveMeTubeJob, 0),
 		failedMeTubeJobs:     make(map[string]*FailedMeTubeJob),
 		deliveredMeTubeItems: make(map[string]*DeliveredMeTubeItem),
@@ -193,9 +183,6 @@ func (b *Bot) Run(ctx context.Context) error {
 	tickerCheck := time.NewTicker(b.cfg.CheckInterval)
 	defer tickerCheck.Stop()
 
-	tickerTorr := time.NewTicker(b.cfg.TorrServerCheckInterval)
-	defer tickerTorr.Stop()
-
 	tickerSave := time.NewTicker(b.cfg.StateSaveInterval)
 	defer tickerSave.Stop()
 
@@ -215,11 +202,6 @@ func (b *Bot) Run(ctx context.Context) error {
 		case <-tickerCheck.C:
 			b.checkTorrentCompletions(ctx)
 
-		case <-tickerTorr.C:
-			if b.cfg.TorrServerEnabled {
-				b.checkTorrServer(ctx)
-			}
-
 		case <-tickerMeTube.C:
 			if b.cfg.MeTubeEnabled {
 				b.checkMeTubeCompletions(ctx)
@@ -232,7 +214,6 @@ func (b *Bot) Run(ctx context.Context) error {
 
 		case <-tickerCleanup.C:
 			b.cleanupExpired(ctx)
-			b.checkPendingLimits(ctx)
 
 		default:
 			// Poll Telegram updates
@@ -630,29 +611,6 @@ func (b *Bot) handleCallback(ctx context.Context, cb *telegram.CallbackQuery) {
 		return
 	}
 
-	if strings.HasPrefix(data, "ts_dl:") {
-		hash := strings.TrimPrefix(data, "ts_dl:")
-		if b.handleTorrServerDownload(ctx, chatID, hash, cb.Message, callerID) {
-			b.deleteOtherTorrServerMessages(ctx, hash, chatID)
-			b.mu.Lock()
-			delete(b.torrServerMsgIDs, hash)
-			b.mu.Unlock()
-			_ = b.state.Save()
-		}
-		return
-	}
-
-	if strings.HasPrefix(data, "ts_ignore:") {
-		hash := strings.TrimPrefix(data, "ts_ignore:")
-		b.state.AddNotifiedTorrHash(hash)
-		_ = b.tg.DeleteMessage(ctx, chatID, cb.Message.MessageID)
-		b.deleteOtherTorrServerMessages(ctx, hash, chatID)
-		b.mu.Lock()
-		delete(b.torrServerMsgIDs, hash)
-		b.mu.Unlock()
-		_ = b.state.Save()
-		return
-	}
 
 	if strings.HasPrefix(data, "qb_pause:") {
 		hash := strings.TrimPrefix(data, "qb_pause:")
@@ -732,23 +690,7 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 			b.logger.Error("Failed to add magnet to qBittorrent", "err", err)
 			msgText = fmt.Sprintf("❌ Failed to add magnet to qBit: %s", err.Error())
 		} else {
-			limitInfo := ""
-			// If originated from TorrServer, apply configured speed limit
-			if p.Source == "torrserver" && b.cfg.TorrServerDLLimitMbit > 0 {
-				if hash := extractBtih(p.Magnet); hash != "" {
-					limitBytes := int64(b.cfg.TorrServerDLLimitMbit * 1024 * 1024 / 8)
-					b.state.SetPendingLimit(hash, state.PendingLimit{
-						Limit:       limitBytes,
-						Mbit:        b.cfg.TorrServerDLLimitMbit,
-						Attempts:    0,
-						NextAttempt: 0,
-					})
-					limitInfo = fmt.Sprintf("\nSpeed Limit: %d Mbit/s (Pending)", b.cfg.TorrServerDLLimitMbit)
-					_ = b.state.Save()
-				}
-			}
-
-			msgText = fmt.Sprintf("✅ Magnet added to qBit.\nDir: `%s`%s", targetDir, limitInfo)
+			msgText = fmt.Sprintf("✅ Magnet added to qBit.\nDir: `%s`", targetDir)
 			success = true
 		}
 
@@ -926,75 +868,6 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 			Expires:   time.Now().Add(b.cfg.NotificationCleanupTime).Unix(),
 		})
 		b.mu.Unlock()
-	}
-}
-
-func (b *Bot) handleTorrServerDownload(ctx context.Context, chatID int64, hash string, origMsg *telegram.Message, userID int64) bool {
-	torrents, err := b.torrserver.ListTorrents(ctx)
-	if err != nil {
-		_, _ = b.tg.SendMessage(ctx, chatID, "❌ Could not reach TorrServer.", "", nil)
-		return false
-	}
-
-	var target *torrserver.Torrent
-	for i := range torrents {
-		if strings.EqualFold(torrents[i].Hash, hash) {
-			target = &torrents[i]
-			break
-		}
-	}
-
-	if target == nil {
-		_, _ = b.tg.SendMessage(ctx, chatID, "❌ Torrent not found in TorrServer.", "", nil)
-		return false
-	}
-
-	magnet := target.Magnet
-	if magnet == "" {
-		sanitizedHash := regexp.MustCompile(`[^a-fA-F0-9]`).ReplaceAllString(target.Hash, "")
-		title := url.QueryEscape(target.Title)
-		magnet = fmt.Sprintf("magnet:?xt=urn:btih:%s&dn=%s", sanitizedHash, title)
-	}
-
-	b.mu.Lock()
-	b.pendingDownloads[chatID] = &PendingDownload{
-		Type:    "magnet",
-		Magnet:  magnet,
-		DiskIdx: b.cfg.DefaultDiskIdx,
-		Source:  "torrserver",
-		UserID:  userID,
-		Expires: time.Now().Unix() + PendingDownloadExpirySecs,
-	}
-	b.mu.Unlock()
-
-	safeTitle := telegram.EscapeMarkdown(target.Title)
-	newText := fmt.Sprintf("📥 From TorrServer: `%s`\nChoose destination:", safeTitle)
-	kb := b.categoryKeyboard(b.cfg.DefaultDiskIdx)
-
-	if origMsg != nil && len(origMsg.Photo) > 0 {
-		_ = b.tg.EditMessageCaption(ctx, chatID, origMsg.MessageID, newText, "Markdown", kb)
-	} else if origMsg != nil {
-		_ = b.tg.EditMessageText(ctx, chatID, origMsg.MessageID, newText, "Markdown", kb)
-	}
-
-	b.state.AddNotifiedTorrHash(hash)
-	_ = b.state.Save()
-	return true
-}
-
-func (b *Bot) deleteOtherTorrServerMessages(ctx context.Context, hash string, actingChatID int64) {
-	b.mu.Lock()
-	entries, ok := b.torrServerMsgIDs[hash]
-	b.mu.Unlock()
-
-	if !ok {
-		return
-	}
-
-	for _, entry := range entries {
-		if entry.ChatID != actingChatID {
-			_ = b.tg.DeleteMessage(ctx, entry.ChatID, entry.MessageID)
-		}
 	}
 }
 
@@ -1226,9 +1099,6 @@ func (b *Bot) sendStatusMessage(ctx context.Context, chatID int64) {
 			links = append(links, fmt.Sprintf("[MeTube](%s)", b.cfg.MeTubeURL))
 		}
 	}
-	if b.cfg.TorrServerEnabled && b.cfg.TorrServerURL != "" {
-		links = append(links, fmt.Sprintf("[TorrServer](%s)", b.cfg.TorrServerURL))
-	}
 	if b.cfg.JellyfinEnabled && b.cfg.JellyfinURL != "" {
 		links = append(links, fmt.Sprintf("[Jellyfin](%s)", b.cfg.JellyfinURL))
 	}
@@ -1348,125 +1218,6 @@ func (b *Bot) checkTorrentCompletions(ctx context.Context) {
 			go func() {
 				_ = b.jellyfin.RefreshLibrary(context.Background())
 			}()
-		}
-	}
-}
-
-func (b *Bot) checkTorrServer(ctx context.Context) {
-	torrents, err := b.torrserver.ListTorrents(ctx)
-	if err != nil {
-		b.logger.Warn("Failed to list TorrServer torrents", "err", err)
-		b.torrServerFailCount++
-		if b.torrServerFailCount >= 5 {
-			knownChats := b.state.GetKnownChatIDs()
-			for _, cid := range knownChats {
-				_, _ = b.tg.SendMessage(ctx, cid, "⚠️ TorrServer unavailable after 5 attempts. Please check the service.", "", nil)
-			}
-			b.torrServerFailCount = 0
-		}
-		return
-	}
-	b.torrServerFailCount = 0
-
-	activeMap := make(map[string]struct{}, len(torrents))
-	for _, t := range torrents {
-		activeMap[t.Hash] = struct{}{}
-	}
-	b.state.PruneNotifiedTorrHashes(activeMap)
-
-	knownChats := b.state.GetKnownChatIDs()
-
-	for _, t := range torrents {
-		if b.state.IsTorrHashNotified(t.Hash) {
-			continue
-		}
-
-		name := t.Title
-		if name == "" || name == "Unknown" {
-			continue
-		}
-
-		fileInfoStr := ""
-		totalSize := t.GetTotalSize()
-		files := t.ParseFiles()
-
-		if len(files) == 1 {
-			fName := filepath.Base(files[0].Path)
-			fSizeMb := float64(files[0].Length) / 1024 / 1024
-			fileInfoStr = fmt.Sprintf("\n📄 File: `%s`\n📦 Size: %.1f MB", telegram.EscapeMarkdown(fName), fSizeMb)
-		} else if len(files) > 1 {
-			totalSizeMb := float64(totalSize) / 1024 / 1024
-			fileInfoStr = fmt.Sprintf("\n📺 Episodes: %d\n📦 Total Size: %.1f MB", len(files), totalSizeMb)
-		} else if totalSize > 0 {
-			totalSizeMb := float64(totalSize) / 1024 / 1024
-			fileInfoStr = fmt.Sprintf("\n📦 Size: %.1f MB", totalSizeMb)
-		}
-
-		safeName := telegram.EscapeMarkdown(name)
-		msg := fmt.Sprintf("🎬 *New in TorrServer:*\n\n`%s`%s\n\nDownload to qBit?", safeName, fileInfoStr)
-
-		kb := &telegram.InlineKeyboardMarkup{
-			InlineKeyboard: [][]telegram.InlineKeyboardButton{
-				{
-					{Text: "✅ Download", CallbackData: fmt.Sprintf("ts_dl:%s", t.Hash)},
-					{Text: "🙈 Ignore", CallbackData: fmt.Sprintf("ts_ignore:%s", t.Hash)},
-				},
-			},
-		}
-
-		for _, cid := range knownChats {
-			var sentMsg *telegram.Message
-			var err error
-			if t.Poster != "" {
-				sentMsg, err = b.tg.SendPhoto(ctx, cid, t.Poster, msg, "Markdown", kb)
-			}
-			if t.Poster == "" || err != nil {
-				sentMsg, _ = b.tg.SendMessage(ctx, cid, msg, "Markdown", kb)
-			}
-
-			if sentMsg != nil {
-				b.mu.Lock()
-				b.torrServerMsgIDs[t.Hash] = append(b.torrServerMsgIDs[t.Hash], PendingDeletion{
-					ChatID:    cid,
-					MessageID: sentMsg.MessageID,
-				})
-				b.mu.Unlock()
-			}
-		}
-
-		b.state.AddNotifiedTorrHash(t.Hash)
-		_ = b.state.Save()
-	}
-}
-
-func (b *Bot) checkPendingLimits(ctx context.Context) {
-	limits := b.state.GetPendingLimits()
-	now := time.Now().Unix()
-
-	for hash, data := range limits {
-		if now < data.NextAttempt {
-			continue
-		}
-
-		data.Attempts++
-		data.NextAttempt = now + 5
-
-		info, err := b.qb.GetTorrents(ctx, "", hash)
-		if err == nil && len(info) > 0 {
-			if err := b.qb.SetDownloadLimit(ctx, hash, data.Limit); err == nil {
-				b.logger.Info("Applied download limit to torrent", "hash", hash, "mbit", data.Mbit)
-				b.state.DeletePendingLimit(hash)
-				_ = b.state.Save()
-				continue
-			}
-		}
-
-		if data.Attempts >= MaxPendingLimitAttempts {
-			b.logger.Warn("Failed to apply download limit after max attempts, giving up", "hash", hash)
-			b.state.DeletePendingLimit(hash)
-			_ = b.state.Save()
-		} else {
-			b.state.SetPendingLimit(hash, data)
 		}
 	}
 }
@@ -2127,15 +1878,6 @@ func (b *Bot) deliverMeTubeFile(job ActiveMeTubeJob, item metube.HistoryItem) {
 		}
 		_, _ = b.tg.SendMessage(ctx, job.ChatID, fmt.Sprintf("❌ Failed to send file to Telegram: %s\n%s", err.Error(), links), "Markdown", nil)
 	}
-}
-
-func extractBtih(magnet string) string {
-	re := regexp.MustCompile(`(?i)urn:btih:([a-zA-Z0-9]+)`)
-	match := re.FindStringSubmatch(magnet)
-	if len(match) > 1 {
-		return strings.ToLower(match[1])
-	}
-	return ""
 }
 
 func cleanTorrentName(name string) string {

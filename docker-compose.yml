@@ -73,13 +73,6 @@ services:
       - JELLYFIN_URL=${JELLYFIN_URL:-http://127.0.0.1:8096}
       - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
 
-      # ============================================================
-      # 7. TorrServer Integration (Optional)
-      # ============================================================
-      - TORRSERVER_ENABLED=${TORRSERVER_ENABLED:-false}
-      - TORRSERVER_URL=${TORRSERVER_URL:-http://127.0.0.1:8090}
-      - TORRSERVER_DL_LIMIT_MBIT=${TORRSERVER_DL_LIMIT_MBIT:-100}
-
   # ------------------------------------------------------------
   # Local Telegram Bot API Server (Optional)
   # Uncomment/keep this service if you want to bypass Telegram's
