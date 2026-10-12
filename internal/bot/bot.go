@@ -64,15 +64,16 @@ type ActiveMeTubeJob struct {
 
 // DeliveredMeTubeItem tracks a MeTube item delivered to Telegram so the user can delete or keep it.
 type DeliveredMeTubeItem struct {
-	Token     string
-	ItemID    string
-	URL       string
-	Folder    string
-	Filename  string
-	ChatID    int64
-	UserID    int64
-	MessageID int64
-	CreatedAt time.Time
+	Token       string
+	ItemID      string
+	URL         string
+	OriginalURL string
+	Folder      string
+	Filename    string
+	ChatID      int64
+	UserID      int64
+	MessageID   int64
+	CreatedAt   time.Time
 }
 
 // FailedMeTubeJob holds state for a failed MeTube download to allow retry or cancel.
@@ -1487,7 +1488,11 @@ func (b *Bot) handleMeTubeCancel(ctx context.Context, cb *telegram.CallbackQuery
 	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "🗑 Removed", false)
 
 	go func(itemID, itemURL string) {
-		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, true)
+		delCtx, delCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer delCancel()
+		if err := b.metube.DeleteByItemOrURL(delCtx, itemID, itemURL, true); err != nil {
+			b.logger.Warn("Failed to delete failed download on MeTube", "err", err, "id", itemID, "url", itemURL)
+		}
 	}(job.ItemID, job.URL)
 
 	_ = b.tg.DeleteMessage(ctx, chatID, cb.Message.MessageID)
@@ -1527,7 +1532,11 @@ func (b *Bot) handleMeTubeCancelActive(ctx context.Context, cb *telegram.Callbac
 	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "❌ Cancelled", false)
 
 	go func(itemID, itemURL string) {
-		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, true)
+		delCtx, delCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer delCancel()
+		if err := b.metube.DeleteByItemOrURL(delCtx, itemID, itemURL, true); err != nil {
+			b.logger.Warn("Failed to cancel/delete download on MeTube", "err", err, "id", itemID, "url", itemURL)
+		}
 	}(targetJob.MeTubeItemID, targetJob.URL)
 
 	_ = b.tg.DeleteMessage(ctx, chatID, cb.Message.MessageID)
@@ -1557,10 +1566,41 @@ func (b *Bot) handleMeTubeDeleteFile(ctx context.Context, cb *telegram.CallbackQ
 
 	_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "🗑 Deleting from MeTube...", false)
 
-	go func(itemID, itemURL string) {
-		_ = b.metube.DeleteByItemOrURL(context.Background(), itemID, itemURL, true)
-	}(item.ItemID, item.URL)
+	delCtx, delCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer delCancel()
 
+	err := b.metube.DeleteByItemOrURL(delCtx, item.ItemID, item.URL, true, item.OriginalURL)
+
+	// Also delete local file if accessible on configured disks
+	if item.Filename != "" {
+		for _, d := range b.cfg.Disks {
+			targetPath := filepath.Join(d, item.Folder, item.Filename)
+			if _, statErr := os.Stat(targetPath); statErr == nil {
+				if removeErr := os.Remove(targetPath); removeErr == nil {
+					b.logger.Info("Deleted local file from disk", "path", targetPath)
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		b.logger.Error("Failed to delete item from MeTube", "err", err, "id", item.ItemID, "url", item.URL)
+		b.mu.Lock()
+		b.deliveredMeTubeItems[token] = item
+		b.mu.Unlock()
+
+		failKb := &telegram.InlineKeyboardMarkup{
+			InlineKeyboard: [][]telegram.InlineKeyboardButton{
+				{
+					{Text: "⚠️ Deletion Failed (Retry)", CallbackData: fmt.Sprintf("metube_del_file:%s", token)},
+				},
+			},
+		}
+		_ = b.tg.EditMessageReplyMarkup(ctx, chatID, cb.Message.MessageID, failKb)
+		return
+	}
+
+	b.logger.Info("Successfully deleted from MeTube", "id", item.ItemID, "url", item.URL)
 	doneKb := &telegram.InlineKeyboardMarkup{
 		InlineKeyboard: [][]telegram.InlineKeyboardButton{
 			{
@@ -1791,15 +1831,20 @@ func (b *Bot) deliverMeTubeFile(job ActiveMeTubeJob, item metube.HistoryItem) {
 	}
 
 	token := fmt.Sprintf("%x", time.Now().UnixNano())
+	itemURL := item.URL
+	if itemURL == "" {
+		itemURL = job.URL
+	}
 	delItem := &DeliveredMeTubeItem{
-		Token:     token,
-		ItemID:    item.ID,
-		URL:       item.URL,
-		Folder:    item.Folder,
-		Filename:  cleanFileName,
-		ChatID:    job.ChatID,
-		UserID:    job.UserID,
-		CreatedAt: time.Now(),
+		Token:       token,
+		ItemID:      item.ID,
+		URL:         itemURL,
+		OriginalURL: job.URL,
+		Folder:      item.Folder,
+		Filename:    cleanFileName,
+		ChatID:      job.ChatID,
+		UserID:      job.UserID,
+		CreatedAt:   time.Now(),
 	}
 	b.mu.Lock()
 	b.deliveredMeTubeItems[token] = delItem

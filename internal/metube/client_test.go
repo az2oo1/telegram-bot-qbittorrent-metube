@@ -168,8 +168,70 @@ func TestDeleteByItemOrURL(t *testing.T) {
 	if !receivedDel.DeleteFiles {
 		t.Errorf("expected DeleteFiles to be true, got false")
 	}
-	if len(receivedDel.IDs) == 0 || receivedDel.IDs[0] != "item123" {
-		t.Errorf("expected ID item123 to be deleted, got %+v", receivedDel.IDs)
+	hasURL := false
+	hasID := false
+	for _, id := range receivedDel.IDs {
+		if id == "https://youtube.com/watch?v=123" {
+			hasURL = true
+		}
+		if id == "item123" {
+			hasID = true
+		}
+	}
+	if !hasURL {
+		t.Errorf("expected URL https://youtube.com/watch?v=123 to be in delete payload, got %+v", receivedDel.IDs)
+	}
+	if !hasID {
+		t.Errorf("expected ID item123 to be in delete payload, got %+v", receivedDel.IDs)
+	}
+}
+
+func TestDeleteByItemOrURL_DifferentInputURL(t *testing.T) {
+	var receivedDel DeleteRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/history" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"done": [{"id": "vid999", "url": "https://www.youtube.com/watch?v=vid999", "filename": "clip.mp4"}],
+				"queue": []
+			}`))
+			return
+		}
+		if r.URL.Path == "/delete" {
+			if err := json.NewDecoder(r.Body).Decode(&receivedDel); err != nil {
+				http.Error(w, "bad json", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", nil)
+	// User submitted youtu.be short URL
+	err := c.DeleteByItemOrURL(context.Background(), "vid999", "https://youtu.be/vid999", true)
+	if err != nil {
+		t.Fatalf("DeleteByItemOrURL failed: %v", err)
+	}
+
+	hasCanonicalURL := false
+	hasShortURL := false
+	for _, id := range receivedDel.IDs {
+		if id == "https://www.youtube.com/watch?v=vid999" {
+			hasCanonicalURL = true
+		}
+		if id == "https://youtu.be/vid999" {
+			hasShortURL = true
+		}
+	}
+	if !hasCanonicalURL {
+		t.Errorf("expected canonical URL from MeTube history to be included, got %+v", receivedDel.IDs)
+	}
+	if !hasShortURL {
+		t.Errorf("expected submitted short URL to be included, got %+v", receivedDel.IDs)
 	}
 }
 

@@ -303,37 +303,140 @@ func (c *Client) Delete(ctx context.Context, ids []string, where string, deleteF
 	return nil
 }
 
-// DeleteByItemOrURL attempts to find and delete matching items from MeTube history (both done and queue).
-func (c *Client) DeleteByItemOrURL(ctx context.Context, id, targetURL string, deleteFiles bool) error {
-	idsToDeleteDone := make([]string, 0)
-	idsToDeleteQueue := make([]string, 0)
-	if id != "" {
-		idsToDeleteDone = append(idsToDeleteDone, id)
-		idsToDeleteQueue = append(idsToDeleteQueue, id)
+func addUnique(list []string, val string) []string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return list
 	}
+	for _, item := range list {
+		if item == val {
+			return list
+		}
+	}
+	return append(list, val)
+}
+
+// DeleteByItemOrURL attempts to find and delete matching items from MeTube history (both done and queue).
+// MeTube indexes downloads internally by their media URL (and in some contexts by video ID),
+// so both matching URLs and IDs are gathered and submitted to ensure complete removal from WebUI and disk.
+func (c *Client) DeleteByItemOrURL(ctx context.Context, id, targetURL string, deleteFiles bool, extraURLs ...string) error {
+	idsDone := make([]string, 0)
+	idsQueue := make([]string, 0)
+
+	allInputURLs := make([]string, 0, len(extraURLs)+2)
+	if targetURL != "" {
+		allInputURLs = append(allInputURLs, targetURL)
+	}
+	for _, u := range extraURLs {
+		if u != "" {
+			allInputURLs = append(allInputURLs, u)
+		}
+	}
+
+	matchesItem := func(item HistoryItem) bool {
+		if id != "" && (item.ID == id || item.URL == id || (item.URL != "" && strings.Contains(item.URL, id))) {
+			return true
+		}
+		for _, u := range allInputURLs {
+			if u == "" {
+				continue
+			}
+			if item.URL == u || strings.EqualFold(item.URL, u) {
+				return true
+			}
+			if item.ID != "" && strings.Contains(u, item.ID) {
+				return true
+			}
+			if item.URL != "" && (strings.Contains(u, item.URL) || strings.Contains(item.URL, u)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	foundInDone := false
+	foundInQueue := false
 
 	hist, err := c.GetHistory(ctx)
 	if err == nil && hist != nil {
 		for _, item := range hist.Done {
-			matches := (id != "" && item.ID == id) || (targetURL != "" && (item.URL == targetURL || (item.ID != "" && strings.Contains(targetURL, item.ID))))
-			if matches && item.ID != "" {
-				idsToDeleteDone = append(idsToDeleteDone, item.ID)
+			if matchesItem(item) {
+				foundInDone = true
+				if item.URL != "" {
+					idsDone = addUnique(idsDone, item.URL)
+				}
+				if item.ID != "" {
+					idsDone = addUnique(idsDone, item.ID)
+				}
 			}
 		}
 		for _, item := range hist.Queue {
-			matches := (id != "" && item.ID == id) || (targetURL != "" && (item.URL == targetURL || (item.ID != "" && strings.Contains(targetURL, item.ID))))
-			if matches && item.ID != "" {
-				idsToDeleteQueue = append(idsToDeleteQueue, item.ID)
+			if matchesItem(item) {
+				foundInQueue = true
+				if item.URL != "" {
+					idsQueue = addUnique(idsQueue, item.URL)
+				}
+				if item.ID != "" {
+					idsQueue = addUnique(idsQueue, item.ID)
+				}
+			}
+		}
+		for _, item := range hist.Pending {
+			if matchesItem(item) {
+				foundInQueue = true
+				if item.URL != "" {
+					idsQueue = addUnique(idsQueue, item.URL)
+				}
+				if item.ID != "" {
+					idsQueue = addUnique(idsQueue, item.ID)
+				}
 			}
 		}
 	}
 
-	if len(idsToDeleteDone) > 0 {
-		_ = c.Delete(ctx, idsToDeleteDone, "done", deleteFiles)
+	// Always ensure input URL and ID are included in the relevant delete lists
+	if foundInDone {
+		if id != "" {
+			idsDone = addUnique(idsDone, id)
+		}
+		for _, u := range allInputURLs {
+			idsDone = addUnique(idsDone, u)
+		}
 	}
-	if len(idsToDeleteQueue) > 0 {
-		_ = c.Delete(ctx, idsToDeleteQueue, "queue", deleteFiles)
+	if foundInQueue {
+		if id != "" {
+			idsQueue = addUnique(idsQueue, id)
+		}
+		for _, u := range allInputURLs {
+			idsQueue = addUnique(idsQueue, u)
+		}
 	}
-	return nil
+
+	// If neither was explicitly matched in history, fallback to trying both
+	if !foundInDone && !foundInQueue {
+		if id != "" {
+			idsDone = addUnique(idsDone, id)
+			idsQueue = addUnique(idsQueue, id)
+		}
+		for _, u := range allInputURLs {
+			idsDone = addUnique(idsDone, u)
+			idsQueue = addUnique(idsQueue, u)
+		}
+	}
+
+	var lastErr error
+	if len(idsDone) > 0 {
+		if err := c.Delete(ctx, idsDone, "done", deleteFiles); err != nil {
+			lastErr = err
+		}
+	}
+	if len(idsQueue) > 0 {
+		if err := c.Delete(ctx, idsQueue, "queue", deleteFiles); err != nil && lastErr == nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
+
+
 
