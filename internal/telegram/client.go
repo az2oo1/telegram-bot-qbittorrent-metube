@@ -3,11 +3,13 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strings"
 	"time"
 )
@@ -282,7 +284,17 @@ func (c *Client) sendMediaFile(ctx context.Context, endpoint, fieldName string, 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
-	part, err := writer.CreateFormFile(fieldName, fileName)
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, fileName))
+	contentType := "application/octet-stream"
+	if endpoint == "sendVideo" {
+		contentType = "video/mp4"
+	} else if endpoint == "sendAudio" {
+		contentType = "audio/mpeg"
+	}
+	h.Set("Content-Type", contentType)
+
+	part, err := writer.CreatePart(h)
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +320,16 @@ func (c *Client) sendMediaFile(ctx context.Context, endpoint, fieldName string, 
 	}
 	if endpoint == "sendVideo" {
 		_ = writer.WriteField("supports_streaming", "true")
+		duration, width, height := parseMP4Metadata(fileData)
+		if duration > 0 {
+			_ = writer.WriteField("duration", fmt.Sprintf("%d", duration))
+		}
+		if width > 0 {
+			_ = writer.WriteField("width", fmt.Sprintf("%d", width))
+		}
+		if height > 0 {
+			_ = writer.WriteField("height", fmt.Sprintf("%d", height))
+		}
 	}
 
 	if err := writer.Close(); err != nil {
@@ -360,4 +382,105 @@ func EscapeMarkdown(text string) string {
 		"`", "\\`",
 	)
 	return replacer.Replace(text)
+}
+
+// parseMP4Metadata extracts video duration (in seconds), width, and height from MP4 container boxes.
+func parseMP4Metadata(data []byte) (duration, width, height int) {
+	if len(data) < 8 {
+		return 0, 0, 0
+	}
+
+	findBox := func(buf []byte, target string) []byte {
+		offset := 0
+		for offset+8 <= len(buf) {
+			size := int(binary.BigEndian.Uint32(buf[offset : offset+4]))
+			name := string(buf[offset+4 : offset+8])
+			boxEnd := 0
+			if size == 1 {
+				if offset+16 > len(buf) {
+					break
+				}
+				size64 := int(binary.BigEndian.Uint64(buf[offset+8 : offset+16]))
+				boxEnd = offset + size64
+				if name == target && boxEnd <= len(buf) {
+					return buf[offset+16 : boxEnd]
+				}
+				offset = boxEnd
+			} else if size == 0 {
+				boxEnd = len(buf)
+				if name == target {
+					return buf[offset+8 : boxEnd]
+				}
+				break
+			} else {
+				if size < 8 {
+					break
+				}
+				boxEnd = offset + size
+				if boxEnd > len(buf) {
+					boxEnd = len(buf)
+				}
+				if name == target {
+					return buf[offset+8 : boxEnd]
+				}
+				offset = boxEnd
+			}
+		}
+		return nil
+	}
+
+	moov := findBox(data, "moov")
+	if len(moov) == 0 {
+		return 0, 0, 0
+	}
+
+	mvhd := findBox(moov, "mvhd")
+	if len(mvhd) >= 24 {
+		version := mvhd[0]
+		if version == 0 {
+			timescale := int(binary.BigEndian.Uint32(mvhd[12:16]))
+			dur := int(binary.BigEndian.Uint32(mvhd[16:20]))
+			if timescale > 0 {
+				duration = dur / timescale
+			}
+		} else if version == 1 && len(mvhd) >= 32 {
+			timescale := int(binary.BigEndian.Uint32(mvhd[20:24]))
+			dur := int(binary.BigEndian.Uint64(mvhd[24:32]))
+			if timescale > 0 {
+				duration = dur / timescale
+			}
+		}
+	}
+
+	offset := 0
+	for offset+8 <= len(moov) {
+		size := int(binary.BigEndian.Uint32(moov[offset : offset+4]))
+		name := string(moov[offset+4 : offset+8])
+		if size < 8 || offset+size > len(moov) {
+			break
+		}
+		if name == "trak" {
+			trak := moov[offset+8 : offset+size]
+			tkhd := findBox(trak, "tkhd")
+			if len(tkhd) >= 84 {
+				version := tkhd[0]
+				var w, h int
+				if version == 0 && len(tkhd) >= 84 {
+					w = int(binary.BigEndian.Uint32(tkhd[76:80]) >> 16)
+					h = int(binary.BigEndian.Uint32(tkhd[80:84]) >> 16)
+				} else if version == 1 && len(tkhd) >= 96 {
+					w = int(binary.BigEndian.Uint32(tkhd[88:92]) >> 16)
+					h = int(binary.BigEndian.Uint32(tkhd[92:96]) >> 16)
+				}
+				if w > 0 && h > 0 {
+					width = w
+					height = h
+					break
+				}
+			}
+		}
+		offset += size
+	}
+
+	return duration, width, height
 }

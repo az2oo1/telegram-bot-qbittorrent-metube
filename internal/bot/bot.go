@@ -791,17 +791,24 @@ func (b *Bot) finalizeDownload(ctx context.Context, chatID int64, catKey, target
 		if quality == "" {
 			quality = b.cfg.MeTubeDefaultQuality
 		}
+		downloadType := "video"
+		codec := "h264"
 		format := "mp4"
 		if p.MeTubeFormat == "audio" {
+			downloadType = "audio"
+			codec = "auto"
 			format = "mp3"
 		}
 
 		err := b.metube.AddDownload(ctx, metube.AddRequest{
-			URL:       p.URL,
-			Quality:   quality,
-			Format:    format,
-			Folder:    catKey,
-			AutoStart: true,
+			URL:          p.URL,
+			DownloadType: downloadType,
+			Codec:        codec,
+			VideoCodec:   codec,
+			Quality:      quality,
+			Format:       format,
+			Folder:       catKey,
+			AutoStart:    true,
 		})
 
 		if err != nil {
@@ -1650,17 +1657,24 @@ func (b *Bot) handleMeTubeRetry(ctx context.Context, cb *telegram.CallbackQuery,
 	if quality == "" {
 		quality = b.cfg.MeTubeDefaultQuality
 	}
+	downloadType := "video"
+	codec := "h264"
 	format := "mp4"
 	if job.Format == "audio" {
+		downloadType = "audio"
+		codec = "auto"
 		format = "mp3"
 	}
 
 	err := b.metube.AddDownload(ctx, metube.AddRequest{
-		URL:       job.URL,
-		Quality:   quality,
-		Format:    format,
-		Folder:    job.Folder,
-		AutoStart: true,
+		URL:          job.URL,
+		DownloadType: downloadType,
+		Codec:        codec,
+		VideoCodec:   codec,
+		Quality:      quality,
+		Format:       format,
+		Folder:       job.Folder,
+		AutoStart:    true,
 	})
 
 	if err != nil {

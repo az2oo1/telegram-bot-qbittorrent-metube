@@ -15,8 +15,11 @@ import (
 // AddRequest represents the JSON payload expected by MeTube's /add endpoint.
 type AddRequest struct {
 	URL              string `json:"url"`
+	DownloadType     string `json:"download_type,omitempty"`
 	Quality          string `json:"quality,omitempty"`
 	Format           string `json:"format,omitempty"`
+	Codec            string `json:"codec,omitempty"`
+	VideoCodec       string `json:"video_codec,omitempty"`
 	Folder           string `json:"folder,omitempty"`
 	CustomNamePrefix string `json:"custom_name_prefix,omitempty"`
 	AutoStart        bool   `json:"auto_start"`
