@@ -1,0 +1,27 @@
+[Unit]
+Description=Telegram qBittorrent & MeTube Bot (qBot)
+After=network.target
+
+[Service]
+# Security Hardening
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+
+# User and Group (Modify these before deployment)
+User=<USER>
+Group=<USER>
+
+# Execution (points to compiled binary and directory containing .env)
+ExecStart=/home/<USER>/qtorrentbot/qbot
+WorkingDirectory=/home/<USER>/qtorrentbot
+EnvironmentFile=-/home/<USER>/qtorrentbot/.env
+
+# Restart Logic
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

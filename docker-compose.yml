@@ -1,0 +1,41 @@
+services:
+  qbot:
+    build: .
+    container_name: qbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Data directory for persistent bot state and logs
+      - ./data:/app/data
+
+      # Optional: Mount download storage directories configured in your .env DISKS setting
+      - /mnt/ftp:/mnt/ftp
+      - /mnt/ftp2:/mnt/ftp2
+
+    network_mode: host
+
+    # Environment variables (optional overrides)
+    environment:
+      - TZ=UTC
+
+  # Official Local Telegram Bot API Server (Enables up to 2 GB file upload/download limits)
+  # To run: get TELEGRAM_API_ID & TELEGRAM_API_HASH from https://my.telegram.org,
+  # fill them in .env, set TELEGRAM_API_URL=http://127.0.0.1:8082, and run:
+  #   docker compose --profile local-api up -d
+  # (or uncomment COMPOSE_PROFILES=local-api in .env)
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    profiles:
+      - local-api
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      TELEGRAM_LOCAL: "true"
+      TELEGRAM_STAT: "true"
+    ports:
+      - "8082:8081"
+    volumes:
+      - ./data/telegram-bot-api:/var/lib/telegram-bot-api

@@ -1,0 +1,83 @@
+package metube
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestIsVideoURL(t *testing.T) {
+	c := NewClient("http://localhost:8081", "", []string{"youtube.com", "youtu.be", "vimeo.com"})
+
+	valid := []string{
+		"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		"https://youtu.be/dQw4w9WgXcQ",
+		"http://vimeo.com/12345678",
+		"https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+	}
+
+	for _, u := range valid {
+		if !c.IsVideoURL(u) {
+			t.Errorf("expected %s to be recognized as video URL", u)
+		}
+	}
+
+	invalid := []string{
+		"https://google.com",
+		"https://github.com",
+		"not a url",
+		"ftp://youtube.com/video",
+		"",
+	}
+
+	for _, u := range invalid {
+		if c.IsVideoURL(u) {
+			t.Errorf("expected %s NOT to be recognized as video URL", u)
+		}
+	}
+}
+
+func TestAddDownload(t *testing.T) {
+	var received AddRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/add" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", nil)
+	err := c.AddDownload(context.Background(), AddRequest{
+		URL:       "https://www.youtube.com/watch?v=test",
+		Quality:   "best",
+		Format:    "mp4",
+		Folder:    "movies",
+		AutoStart: true,
+	})
+
+	if err != nil {
+		t.Fatalf("AddDownload failed: %v", err)
+	}
+
+	if received.URL != "https://www.youtube.com/watch?v=test" || received.Folder != "movies" || received.Format != "mp4" {
+		t.Fatalf("unexpected request received by MeTube server: %+v", received)
+	}
+}

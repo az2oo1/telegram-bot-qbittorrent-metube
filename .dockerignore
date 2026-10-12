@@ -1,0 +1,20 @@
+# Git and documentation
+.git/
+.gitignore
+.github/
+README.md
+img/
+*.service
+
+# Local environment & secrets
+.env
+*.log
+
+# Runtime data
+data/
+bot_state.json
+
+# Local binaries
+/qbot
+*.exe
+*.test

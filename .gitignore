@@ -1,0 +1,19 @@
+# Secrets and local environment
+.env
+
+# Runtime data and logs
+data/
+bot_state.json
+*.log
+
+# Compiled binaries
+/qbot
+*.exe
+*.test
+*~
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
